@@ -17,8 +17,20 @@ Currently only tested on python 3.9 and Linux
 
 Requires FFmpeg to be installed, only tested with version 4.4.2-1+b1
 
+run pip install -r /path/to/requirements.txt
+
 
 <h3>Usage</h3>
+```
 python3 frameFinder.py (path_to_file)
-
 python3 frameFinder.py -h  for help
+```
+
+<h3>Usage in other scripts</h3>
+Check testharness.py
+
+```
+import frameFinder
+frameFinder.process_image("path_to_image", optional_args...)
+```
+
