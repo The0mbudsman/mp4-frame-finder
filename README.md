@@ -31,7 +31,8 @@ python3 frameFinder.py -h  for help
 Check testharness.py
 
 ```
-import frameFinder
-frameFinder.process_image("path_to_image", optional_args...)
+from frameFinder import frameFinder
+ff = frameFinder(clustersize=4096, output_dir_name=f"{basedir}/{file_name_only}", nocleanup=True)
+ff.process_image(file)
 ```
 
