@@ -5,20 +5,20 @@
     and save them as jpegs to an output directory called FrameFinder_output"""
 
 import argparse
-from hashlib import md5
 import math
 import os
 import re
-import numpy as np
 from itertools import repeat
 from tqdm import tqdm
 from glob import glob
- 
-import ffmpeg
 from multiprocessing import Pool, cpu_count
 
+import ffmpeg
+from bitstring import BitArray
+
+
 class frameFinder:
-    def __init__(self, clustersize:int=4096, nocleanup:bool=False, unique:bool=False, output_dir_name:str="FrameFinder_output", decoding_buffer:int=499):
+    def __init__(self, clustersize:int=4096, nocleanup:bool=False, unique:bool=False, output_dir_name:str="FrameFinder_output", decoding_buffer:int=99):
         """This is the main function that does all the work.
         Arguments: 
         @clustersize: Size of a cluster to iterate through (optional, default: 4096)
@@ -161,7 +161,7 @@ class frameFinder:
                             else:
                                 PPS = bytes_after_SPS[match:match+size+1]
                                 complete_header = b"\x00\x00\x01" + SPS + b"\x00\x00\x01" + PPS
-                                self.complete_h264_headers.append({"data": complete_header, "saved_count": 0})
+                                self.complete_h264_headers.append({"data": complete_header, "saved_count": 0, "SPS": SPS, "PPS": PPS})
 
     def register_partial_SPS_PPS_header(self, i:int, bytes:bytes):
         """This function is called when a SPS/PPS header is found but the cluster is ending, so the header will be cut off.
@@ -243,13 +243,13 @@ class frameFinder:
 
     def decode_iframes(self, NUM_PROCS):
         """This function calls ffmpeg to attempt to decode the frames in the global object. It
-        brute forces each header with each newly completed frame, and saves them into a directory"""
+        brute forces each header with each newly completed frame, and saves them into a directory"""       
         process_size = min(NUM_PROCS, len(self.complete_h264_headers))
         pool = Pool(processes=process_size)
         results = pool.map(self.decode_frames_with_header_worker, zip(enumerate(self.complete_h264_headers), repeat(self.complete_iframes))) ##############
         for i,result in enumerate(results):
             self.complete_h264_headers[i]["saved_count"] = result
-        
+
     def decode_frames_with_header_worker(self, data_zip:list):
         '''This helps with multipool'''
         headers_tup, complete_iframes = data_zip
@@ -257,12 +257,16 @@ class frameFinder:
         blob = b"\x00" # starting delimiter has an additional 0 byte.
         ## assemble an annex B compliant blob of SPS, PPS, IDR FRAME, SPS, PPS, IDR FRAME, ETC....
         for frame in complete_iframes:
-            blob += header["data"] + b"\x00\x00\x01" + frame["data"]
-        # with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
-        #     f.write(blob)
+            mb_in_slice = self.get_mb_in_slice(frame["data"][1:10])
+            if (mb_in_slice == 0):
+                blob += header["data"] + b"\x00\x00\x01" + frame["data"]
+            else:
+                blob += b"\x00\x00\x01" + frame["data"]
+        with open (f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
+            f.write(blob)
         process = (ffmpeg
-                .input("pipe:",fflags="+discardcorrupt")
-                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=header["saved_count"]+1, vsync="passthrough", vcodec="mjpeg", loglevel="quiet")
+                .input("pipe:")
+                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="passthrough", vcodec="mjpeg", loglevel="quiet")
                 .run_async(pipe_stdin=True)
                 )
         process.communicate(input=blob)
@@ -273,6 +277,22 @@ class frameFinder:
         tokens = files_saved[len(files_saved)-1].split("/")
         last_file = int(tokens[len(tokens)-1].split(".")[0].split("frame")[1])
         return last_file
+
+    def get_mb_in_slice(self, payload:bytes):
+        c = BitArray(hex=payload.hex()).bin
+        leadingZeroBits = -1
+        for digit in c :
+            if digit == "0":
+                leadingZeroBits+=1
+            else: # up to and including 1
+                leadingZeroBits+=1
+                break
+        if (leadingZeroBits != 0 ):
+            payload = int(c[leadingZeroBits+1:leadingZeroBits+1+leadingZeroBits],2)
+        else:
+            payload = 0
+        mb_slice = (2**leadingZeroBits)-1 + payload
+        return(mb_slice)
 
     # def entropy_of_cluster(self,data):
     #     p_data = data.value_counts()           # counts occurrence of each value
@@ -398,6 +418,8 @@ class frameFinder:
                 # Transfer the frames which have 0 remaining length to be appended to the "complete_iframes" list
                 # Also remove them from the "potential_iframes" list
                 # If we find a single instance of 00 00 00 00/01/02/03, then it can't be a valid frame, as these should have had efmulation prevention bytes placed in them.
+                
+                
                 self.complete_iframes += [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] <= 0 and b"\x00\x00\x00\x00" not in partial_frame["data"]
                 and b"\x00\x00\x00\x01" not in partial_frame["data"]
                 and b"\x00\x00\x00\x02" not in partial_frame["data"]
@@ -451,7 +473,7 @@ if __name__ == "__main__":
     OUTPUT_DIR_NAME = "FrameFinder_output"
 
     parser = argparse.ArgumentParser(
-        "frameCarver", description="Attempts to extract i-frames from h264 encoded videos in a disk image, for use when the filesystem information or file header is missing or corrupted")
+        "frameFinder", description="Attempts to extract i-frames from h264 encoded videos in a disk image, for use when the filesystem information or file header is missing or corrupted")
     parser.add_argument("imgfile", help="path to raw image file", type=str)
     parser.add_argument("--cluster", dest="cluster_size_bits", type=int,
                         default=4096, help="cluster size (default: 4096)")
@@ -464,13 +486,10 @@ if __name__ == "__main__":
                         const=True, default=False, 
                         help="Attempts to remove false positive matches in the output directory. (default: Does not attempt a cleanup). There is a possibility that a small number \
                             of legitimate frames are removed in this process, but most if not all false positives will be removed ")
-
     #########################################################################################
     # Step 0 Initialise some stuff
     #########################################################################################
-
     # Parse Arguments and set up some operational params
-
     args = parser.parse_args()
     clustersize = args.cluster_size_bits
     unique = args.unique
