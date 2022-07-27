@@ -8,6 +8,7 @@ import argparse
 import math
 import os
 import re
+from hashlib import md5
 from itertools import repeat
 from tqdm import tqdm
 from glob import glob
@@ -27,6 +28,7 @@ class frameFinder:
         @unique: Removes duplicate h264 headers before decoding found frames. Will speed up operation. When this option is not enabled, i-frames \
             from the same video may exist in multiple output directories if two videos have the same headers" (optional, default: Do not remove defaults).
         @output_dir_name: Where to dump the output, base name, after multiple runs, numbers will be appended to this directory name. (optional, default: 'FrameFinder_output')
+        @decoding_buffer: May provide a small speed up increasing this above 99, but it is advised not to change this.
         """
         # Initialising some useful variables
 
@@ -265,11 +267,16 @@ class frameFinder:
         with open (f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
             f.write(blob)
         process = (ffmpeg
-                .input("pipe:")
-                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="passthrough", vcodec="mjpeg", loglevel="quiet")
-                .run_async(pipe_stdin=True)
+                .input(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", f="h264", fflags="discardcorrupt")
+                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="passthrough", vcodec="mjpeg",loglevel="quiet")
+                .run_async()
                 )
-        process.communicate(input=blob)
+        # process = (ffmpeg
+        #         .input("pipe:",fflags="+discardcorrupt")
+        #         .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=header["saved_count"], vcodec="mjpeg", loglevel="quiet")
+        #         .run_async(pipe_stdin=True)
+        #         )
+        # process.communicate(input=blob)
 
         files_saved = sorted(glob(f"./{self.OUTPUT_DIR_NAME}/header_{i}/*.jpg"))
         if (len(files_saved) == 0 ):
@@ -298,6 +305,10 @@ class frameFinder:
     #     p_data = data.value_counts()           # counts occurrence of each value
     #     entropy = scipy.stats.entropy(p_data)  # get entropy from counts
     #     return entropy
+
+    def file_as_bytes(self,file):
+        with file:
+            return file.read()
 
     def process_image(self,filepath):
         """This is the main function that does all the work.
@@ -427,7 +438,7 @@ class frameFinder:
 
                 self.potential_iframes =  [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] != 0 ]
                 
-                if len(self.complete_iframes) > self.decoding_buffer:
+                if (len(self.complete_iframes) > self.decoding_buffer) and (self.get_mb_in_slice(self.complete_iframes[-1]["data"]) != 0 ):
                     self.decode_iframes(self.NUM_PROCS)
                     self.complete_iframes = []
 
@@ -443,6 +454,7 @@ class frameFinder:
         total_saved = 0
         for i, header in enumerate(self.complete_h264_headers):
             total_saved += header["saved_count"]
+            os.remove(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264")
 
         if nocleanup:
             print("Skipping cleanup as requested")
@@ -454,15 +466,13 @@ class frameFinder:
             print("[Step 3/3] Cleaning up output folders")
             cleanup = 0
             for j in tqdm(range(len(self.complete_h264_headers)), desc="Cleaning up output folders", total=len(self.complete_h264_headers)):
-                size = 0
-                for i,file in enumerate(glob(f"./{self.OUTPUT_DIR_NAME}/header_{j}/*.jpg")):
-                    size += os.path.getsize(file)
-                div = 1 if i==0 else i+1
-                av_size = size/div
+                hashes = []
                 for file in glob(f"./{self.OUTPUT_DIR_NAME}/header_{j}/*.jpg"):
-                    if os.path.getsize(file) < av_size/1.5:
+                    filehash = md5(self.file_as_bytes(open(file, 'rb'))).hexdigest()
+                    if filehash in hashes:
                         os.remove(file)
-                        cleanup = cleanup + 1
+                        cleanup += 1
+                    hashes.append(filehash)
             print(f"Recovered a total of {total_saved} iframes from {len(self.complete_h264_headers)} header sets but removed {cleanup} images in the cleanup process, totalling {total_saved-cleanup}")
             print(f"Output is in {self.OUTPUT_DIR_NAME}")
             print("Finished!")
