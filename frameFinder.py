@@ -19,7 +19,7 @@ from bitstring import BitArray
 
 
 class frameFinder:
-    def __init__(self, clustersize:int=4096, nocleanup:bool=False, unique:bool=False, output_dir_name:str="FrameFinder_output", decoding_buffer:int=99):
+    def __init__(self, clustersize:int=4096, nocleanup:bool=False, unique:bool=False, output_dir_name:str="FrameFinder_output", decoding_buffer:int=49):
         """This is the main function that does all the work.
         Arguments: 
         @clustersize: Size of a cluster to iterate through (optional, default: 4096)
@@ -28,7 +28,7 @@ class frameFinder:
         @unique: Removes duplicate h264 headers before decoding found frames. Will speed up operation. When this option is not enabled, i-frames \
             from the same video may exist in multiple output directories if two videos have the same headers" (optional, default: Do not remove defaults).
         @output_dir_name: Where to dump the output, base name, after multiple runs, numbers will be appended to this directory name. (optional, default: 'FrameFinder_output')
-        @decoding_buffer: May provide a small speed up increasing this above 99, but it is advised not to change this.
+        @decoding_buffer: May provide a small speed up increasing this above 49, but it is probably at the cost of performance.
         """
         # Initialising some useful variables
 
@@ -259,25 +259,21 @@ class frameFinder:
         blob = b"\x00" # starting delimiter has an additional 0 byte.
         ## assemble an annex B compliant blob of SPS, PPS, IDR FRAME, SPS, PPS, IDR FRAME, ETC....
         for frame in complete_iframes:
-            mb_in_slice = self.get_mb_in_slice(frame["data"][1:10])
+            mb_in_slice, slice_type = self.parse_exp_golomb(frame["data"][1:30],2)
             if (mb_in_slice == 0):
                 blob += header["data"] + b"\x00\x00\x01" + frame["data"]
             else:
                 blob += b"\x00\x00\x01" + frame["data"]
         with open (f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
             f.write(blob)
+        while not os.access(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", os.R_OK):
+            pass
         process = (ffmpeg
-                .input(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", f="h264", fflags="discardcorrupt")
-                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="passthrough", vcodec="mjpeg",loglevel="quiet")
+                .input(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", f="h264", r="3")
+                .filter("setpts", "N")
+                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="0", vcodec="mjpeg", loglevel="quiet")
                 .run_async()
                 )
-        # process = (ffmpeg
-        #         .input("pipe:",fflags="+discardcorrupt")
-        #         .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=header["saved_count"], vcodec="mjpeg", loglevel="quiet")
-        #         .run_async(pipe_stdin=True)
-        #         )
-        # process.communicate(input=blob)
-
         files_saved = sorted(glob(f"./{self.OUTPUT_DIR_NAME}/header_{i}/*.jpg"))
         if (len(files_saved) == 0 ):
             return 0
@@ -285,21 +281,27 @@ class frameFinder:
         last_file = int(tokens[len(tokens)-1].split(".")[0].split("frame")[1])
         return last_file
 
-    def get_mb_in_slice(self, payload:bytes):
+    def parse_exp_golomb(self,payload:bytes, numberToParse:int):
         c = BitArray(hex=payload.hex()).bin
-        leadingZeroBits = -1
-        for digit in c :
-            if digit == "0":
-                leadingZeroBits+=1
-            else: # up to and including 1
-                leadingZeroBits+=1
-                break
-        if (leadingZeroBits != 0 ):
-            payload = int(c[leadingZeroBits+1:leadingZeroBits+1+leadingZeroBits],2)
+        codes = []
+        for i in range(numberToParse):
+            leadingZeroBits = -1
+            for digit in c :
+                if digit == "0":
+                    leadingZeroBits+=1
+                else: # up to and including 1
+                    leadingZeroBits+=1
+                    break
+            if (leadingZeroBits != 0 ):
+                payload = int(c[leadingZeroBits+1:leadingZeroBits+1+leadingZeroBits],2)
+            else:
+                payload = 0
+            codes.append((2**leadingZeroBits)-1 + payload)
+            c = c[leadingZeroBits+1+leadingZeroBits:]
+        if len(codes) == 1:
+            return codes[0]
         else:
-            payload = 0
-        mb_slice = (2**leadingZeroBits)-1 + payload
-        return(mb_slice)
+            return(codes)
 
     # def entropy_of_cluster(self,data):
     #     p_data = data.value_counts()           # counts occurrence of each value
@@ -430,15 +432,15 @@ class frameFinder:
                 # Also remove them from the "potential_iframes" list
                 # If we find a single instance of 00 00 00 00/01/02/03, then it can't be a valid frame, as these should have had efmulation prevention bytes placed in them.
                 
-                
                 self.complete_iframes += [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] <= 0 and b"\x00\x00\x00\x00" not in partial_frame["data"]
                 and b"\x00\x00\x00\x01" not in partial_frame["data"]
                 and b"\x00\x00\x00\x02" not in partial_frame["data"]
                 and b"\x00\x00\x00\x03" not in partial_frame["data"]]
 
+
                 self.potential_iframes =  [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] != 0 ]
                 
-                if (len(self.complete_iframes) > self.decoding_buffer) and (self.get_mb_in_slice(self.complete_iframes[-1]["data"]) != 0 ):
+                if (len(self.complete_iframes) > self.decoding_buffer) and (self.parse_exp_golomb(self.complete_iframes[-1]["data"][1:30],1) != 0 ):
                     self.decode_iframes(self.NUM_PROCS)
                     self.complete_iframes = []
 
