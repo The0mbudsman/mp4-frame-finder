@@ -7,6 +7,7 @@
 import argparse
 import math
 import os
+import sys
 import re
 from hashlib import md5
 from itertools import repeat
@@ -222,7 +223,7 @@ class frameFinder:
     def get_iframes(self, i, cluster:bytes, match:int):
         """This parses the iframe start. It checks whether the I-frame size falls into limits defined below,
         similar to the SPS/PPS header size """
-        MIN_IFRAME_SIZE = 100
+        MIN_IFRAME_SIZE = 10
         MAX_IFRAME_SIZE = 1510000
         potential_byte_size = cluster[match-4:match]
         iframe_size = int.from_bytes(potential_byte_size, "big")
@@ -242,15 +243,19 @@ class frameFinder:
             }
             
             self.potential_iframes.append(frame)
-
+    
     def decode_iframes(self, NUM_PROCS):
         """This function calls ffmpeg to attempt to decode the frames in the global object. It
         brute forces each header with each newly completed frame, and saves them into a directory"""       
         process_size = min(NUM_PROCS, len(self.complete_h264_headers))
         pool = Pool(processes=process_size)
         results = pool.map(self.decode_frames_with_header_worker, zip(enumerate(self.complete_h264_headers), repeat(self.complete_iframes))) ##############
+        pool.close()
+        pool.join()
         for i,result in enumerate(results):
             self.complete_h264_headers[i]["saved_count"] = result
+    
+
 
     def decode_frames_with_header_worker(self, data_zip:list):
         '''This helps with multipool'''
@@ -264,16 +269,13 @@ class frameFinder:
                 blob += header["data"] + b"\x00\x00\x01" + frame["data"]
             else:
                 blob += b"\x00\x00\x01" + frame["data"]
-        with open (f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
-            f.write(blob)
-        while not os.access(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", os.R_OK):
-            pass
         process = (ffmpeg
-                .input(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", f="h264", r="3")
+                .input("pipe:", f="h264", r="3")
                 .filter("setpts", "N")
                 .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="0", vcodec="mjpeg", loglevel="quiet")
-                .run_async()
+                .run_async(pipe_stdin=True)
                 )
+        process.communicate(input=blob)
         files_saved = sorted(glob(f"./{self.OUTPUT_DIR_NAME}/header_{i}/*.jpg"))
         if (len(files_saved) == 0 ):
             return 0
@@ -456,7 +458,7 @@ class frameFinder:
         total_saved = 0
         for i, header in enumerate(self.complete_h264_headers):
             total_saved += header["saved_count"]
-            os.remove(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264")
+            # os.remove(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264")
 
         if nocleanup:
             print("Skipping cleanup as requested")
