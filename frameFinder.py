@@ -11,6 +11,7 @@ import sys
 import re
 from hashlib import md5
 from itertools import repeat
+from tkinter import NONE
 from tqdm import tqdm
 from glob import glob
 from multiprocessing import Pool, cpu_count
@@ -32,12 +33,28 @@ class frameFinder:
         @decoding_buffer: May provide a small speed up increasing this above 49, but it is probably at the cost of performance.
         """
         # Initialising some useful variables
+        # Convention (but not specification) states IDR frames begin with 65, however this is not always the case:
+        # 
+        # The header byte format is 0 00 00000 
+        #                      bit# 0 12 34567
+        # bit 0 is a forbidden 0 bit
+        # bits 1-2 are the nal_ref_idc. As above, convention says they are be 11, but the specification states they simply must be > 00, so could be 01, 10, or 11
+        # bits 3-7 are the nal_unit_type. This is 5 for IDR frames, 7 for SPS, 8 for PPS.
 
-        self.NALU_IDR_HEADER = b"\x65"  # Coded slice of an IDR picture
-        self.NALU_SPS_HEADER = b"\x67"  # Sequence Parameter Set
-        self.NALU_PPS_HEADER = b"\x68"  # Picture Parameter Set
+        # However, Since the vast majority of IDR frames are 65, instead of 25 or 45 following convention, we only search for 25s/45s if we find
+        # a header that has 27 28 / 47 48 , as they come in threes.
+
+        self.NALU_IDR_HEADER = re.compile(b'[\x65]')  # Coded slice of an IDR picture. 45 and or 25 are added to this iff needed as above.
+        self.NALU_SPS_HEADER = re.compile(b'[\x67|\x47|\x27]') # Sequence Parameter Set options
+        self.NALU_PPS_HEADER = re.compile(b'[\x68|\x48|\x28]') # Picture Parameter Set options
         self.AVCC_BOX_HEADER = b"\x61\x76\x63\x43"  # avcC atom header
         self.OUTPUT_DIR_NAME = output_dir_name
+
+        self.emulation_bytes = re.compile(b"\x00\x00\x00[\x00-\x03]")
+
+        # As above, only search for these if we have to, as it has the potential to slow down operation.
+        self.twentyflag = False
+        self.fourtyflag = False
 
         #Operational params 
         self.clustersize = clustersize
@@ -47,6 +64,9 @@ class frameFinder:
 
         #This'll be used to check if the cluster is all zeros (so skipped)
         self.null_block = b'\x00' * clustersize
+
+        #This holds a bit of the previous cluster incase we need to refer back to it
+        self.prev_cluster = []
 
         # These hold partial and complete h264 headers.
         self.partial_h264_headers = []
@@ -154,7 +174,7 @@ class frameFinder:
                     SPS = bytes[match:match+size+1]
                     bytes_after_SPS = bytes[match+size:]
                     potential_PPS_indices = [_.start() for _ in re.finditer(self.NALU_PPS_HEADER, bytes_after_SPS)]
-                    if potential_SPS_indices == []:
+                    if potential_PPS_indices == []:
                         return
                     else:
                         for match in potential_PPS_indices:
@@ -164,21 +184,34 @@ class frameFinder:
                             else:
                                 PPS = bytes_after_SPS[match:match+size+1]
                                 complete_header = b"\x00\x00\x01" + SPS + b"\x00\x00\x01" + PPS
-                                self.complete_h264_headers.append({"data": complete_header, "saved_count": 0, "SPS": SPS, "PPS": PPS})
+                                if (SPS[0:1] == b"\x27" and PPS[0:1] == b"\x28"):
+                                    self.twentyflag = True
+                                if (SPS[0:1] == b"\x47" and PPS[0:1] == b"\x48"):
+                                    self.fourtyflag = True
+                                self.complete_h264_headers.append({"data": complete_header, "saved_count": 0})
 
     def register_partial_SPS_PPS_header(self, i:int, bytes:bytes):
         """This function is called when a SPS/PPS header is found but the cluster is ending, so the header will be cut off.
         This function attempts to assess how much of the header has been found in order to search for it later
         It is saved in a partial header list. If the SPS length is found in the cluster, the program knows roughly where the PPS should appear, so looks
         in next clusters at that index. If the SPS length isn't found, you're out of luck and it will generate a few false positives."""
-        potential_SPS_index = bytes.find(self.NALU_SPS_HEADER)
-        potential_PPS_index = bytes.find(self.NALU_PPS_HEADER)
-        potential_avcc_index = bytes.find(self.AVCC_BOX_HEADER)
+        potential_SPS_index = re.search(self.NALU_SPS_HEADER, bytes)
+        if potential_SPS_index is not None:
+            potential_SPS_index = potential_SPS_index.start()
+        potential_PPS_index = re.search(self.NALU_PPS_HEADER, bytes)
+        if potential_PPS_index is not None:
+            potential_PPS_index = potential_PPS_index.start()
+        potential_avcc_index = re.search(self.AVCC_BOX_HEADER, bytes)
+        if potential_avcc_index is not None:
+            potential_avcc_index = potential_avcc_index.start()
+            found,total_atom_size = self.determine_avcC_size(potential_avcc_index, bytes)
+        else:
+            total_atom_size = 50 # placeholder number
 
-        SPS_start_found = False if potential_SPS_index == -1 else True
-        PPS_start_found = False if potential_PPS_index == -1 else True
+        SPS_start_found = False if potential_SPS_index == None else True
+        PPS_start_found = False if potential_PPS_index == None else True
 
-        found,total_atom_size = self.determine_avcC_size(potential_avcc_index, bytes)
+
         complete_SPS_found = False
         complete_PPS_found = False
         remaining_length = 0
@@ -199,7 +232,7 @@ class frameFinder:
             # Best case, we actually have the lot
             self.parse_full_SPS_PPS_header(bytes)
             return
-        remaining_length = total_atom_size+1 - len(bytes)
+        remaining_length = total_atom_size +1 - len(bytes)
         partial_header = {
             "new_this_cluster": True,
             "found_in_cluster": i,
@@ -225,11 +258,19 @@ class frameFinder:
         similar to the SPS/PPS header size """
         MIN_IFRAME_SIZE = 10
         MAX_IFRAME_SIZE = 1510000
-        potential_byte_size = cluster[match-4:match]
-        iframe_size = int.from_bytes(potential_byte_size, "big")
+        if (match < 4):
+            from_prev_cluster = 4-match
+            prev_cluster_bytes = self.prev_cluster[-from_prev_cluster:]
+            potential_byte_size = prev_cluster_bytes+cluster[0:match]
+        else:
+            potential_byte_size = cluster[match-4:match]
 
+        iframe_size = int.from_bytes(potential_byte_size, "big")
         if (iframe_size > MIN_IFRAME_SIZE and iframe_size < MAX_IFRAME_SIZE):  # limits determined from tests
             length_of_data_to_append = min(iframe_size, (len(cluster)-match))
+            mb_in_slice, slice_type = self.parse_exp_golomb(cluster[match+1:match+11],2)
+            if slice_type != 2 and slice_type != 7:
+                return
             # Here we define our frame object
             # total length = as determined above
             # remaining_length = The remaining number of bytes to append to it (this gets decremented)
@@ -241,7 +282,6 @@ class frameFinder:
                 "new_this_cluster": True,
                 "data": cluster[match:match+length_of_data_to_append]
             }
-            
             self.potential_iframes.append(frame)
     
     def decode_iframes(self, NUM_PROCS):
@@ -255,8 +295,6 @@ class frameFinder:
         for i,result in enumerate(results):
             self.complete_h264_headers[i]["saved_count"] = result
     
-
-
     def decode_frames_with_header_worker(self, data_zip:list):
         '''This helps with multipool'''
         headers_tup, complete_iframes = data_zip
@@ -264,11 +302,13 @@ class frameFinder:
         blob = b"\x00" # starting delimiter has an additional 0 byte.
         ## assemble an annex B compliant blob of SPS, PPS, IDR FRAME, SPS, PPS, IDR FRAME, ETC....
         for frame in complete_iframes:
-            mb_in_slice, slice_type = self.parse_exp_golomb(frame["data"][1:30],2)
+            mb_in_slice = self.parse_exp_golomb(frame["data"][1:30],1)[0]
             if (mb_in_slice == 0):
                 blob += header["data"] + b"\x00\x00\x01" + frame["data"]
             else:
                 blob += b"\x00\x00\x01" + frame["data"]
+        # with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
+        #     f.write(blob)
         process = (ffmpeg
                 .input("pipe:", f="h264", r="3")
                 .filter("setpts", "N")
@@ -285,8 +325,10 @@ class frameFinder:
 
     def parse_exp_golomb(self,payload:bytes, numberToParse:int):
         c = BitArray(hex=payload.hex()).bin
-        codes = []
+        codes = [0] * numberToParse
         for i in range(numberToParse):
+            if all(digit == "0" for digit in c):
+                return codes
             leadingZeroBits = -1
             for digit in c :
                 if digit == "0":
@@ -294,16 +336,16 @@ class frameFinder:
                 else: # up to and including 1
                     leadingZeroBits+=1
                     break
-            if (leadingZeroBits != 0 ):
-                payload = int(c[leadingZeroBits+1:leadingZeroBits+1+leadingZeroBits],2)
+            if (leadingZeroBits != 0):
+                if (leadingZeroBits*2)+1 < len(c):
+                    payload = int(c[leadingZeroBits+1:(leadingZeroBits*2)+1],2)
+                else:
+                    payload = 0
             else:
                 payload = 0
-            codes.append((2**leadingZeroBits)-1 + payload)
+            codes[i] = ((2**leadingZeroBits)-1 + payload)
             c = c[leadingZeroBits+1+leadingZeroBits:]
-        if len(codes) == 1:
-            return codes[0]
-        else:
-            return(codes)
+        return codes
 
     # def entropy_of_cluster(self,data):
     #     p_data = data.value_counts()           # counts occurrence of each value
@@ -331,7 +373,6 @@ class frameFinder:
                 potential_AVCC_boxes = [_.start()
                                         for _ in re.finditer(self.AVCC_BOX_HEADER, cluster)]
                 for box_index in potential_AVCC_boxes:
-
                     # These cases we dont have space for a full header, the match comes too late in the cluster
                     if (box_index > clustersize-100):
                         start = (max(box_index-4, 0))
@@ -349,7 +390,7 @@ class frameFinder:
                         if (partial_header["SPS_start_found"] and partial_header["complete_SPS_found"] and partial_header["PPS_start_found"]):
                             self.parse_remainder_SPS_PPS_header(partial_header, partial_header["partial_payload"]+bytes_of_interest)
                         else:
-                            if (bytes_of_interest.find(self.NALU_PPS_HEADER) != -1):
+                            if (re.search(self.NALU_PPS_HEADER, bytes_of_interest) != None):
                                 self.parse_remainder_SPS_PPS_header(partial_header, partial_header["partial_payload"]+bytes_of_interest)
 
                 # Transfer the headers which have found a valid end moved into the complete list and removed from the partial list
@@ -377,13 +418,15 @@ class frameFinder:
                             if (partial_header["SPS_start_found"] and partial_header["complete_SPS_found"] and partial_header["PPS_start_found"]):
                                 self.parse_remainder_SPS_PPS_header(partial_header, partial_header["partial_payload"]+bytes_of_interest)
                             else:
-                                if (bytes_of_interest.find(self.NALU_PPS_HEADER) != -1):
+                                if (re.search(self.NALU_PPS_HEADER, bytes_of_interest) != None):
                                     self.parse_remainder_SPS_PPS_header(partial_header, partial_header["partial_payload"]+bytes_of_interest)
                                     
                     # Transfer the headers which have found a valid end moved into the complete list and removed from the partial list
                     self.partial_h264_headers[:] = [partial_header for partial_header in self.partial_h264_headers if partial_header["complete"] == False]
+
         #########################################################################################
         # Step 2.5 is to make output directories for each of the headers and optionally exit if no headers are found.
+        # Additionally, precompile IDR frame regex for speed
         #########################################################################################
         if len(self.complete_h264_headers) == 0:
             print("No headers found in image, exiting.")
@@ -392,6 +435,7 @@ class frameFinder:
             else:
                 return
 
+        # Filter unique if that switch was selected by user
         if unique:
             # https://stackoverflow.com/questions/11092511/list-of-unique-dictionaries
             lenbefore = len(self.complete_h264_headers)
@@ -399,6 +443,8 @@ class frameFinder:
             print(f"Successfully found {lenbefore} SPS/PPS headers, removed {lenbefore - len(self.complete_h264_headers) } duplicate(s)")
         else:
             print(f"Successfully found {len(self.complete_h264_headers)} SPS/PPS headers")
+        
+        # Make some dirs and print some helpful text
         for i in range(len(self.complete_h264_headers)):
             # just in case that folder got deleted during runtime
             if not os.path.exists(f"./{self.OUTPUT_DIR_NAME}"):
@@ -407,6 +453,17 @@ class frameFinder:
             if not os.path.exists(f"./{self.OUTPUT_DIR_NAME}/header_{i}"):
                 os.makedirs(f"./{self.OUTPUT_DIR_NAME}/header_{i}", exist_ok=True)
                 print(f"Made Directory ./{self.OUTPUT_DIR_NAME}/header_{i}")
+
+        # Assemble IDR regex and pre-compile
+        # This could probably be nicer.
+        if (self.twentyflag and self.fourtyflag):
+            self.NALU_IDR_HEADER = re.compile(b'[\x65|\x45|\x25]')
+        elif (self.twentyflag):
+            self.NALU_IDR_HEADER = re.compile(b'[\x65|\x25]')
+        elif (self.fourtyflag):
+            self.NALU_IDR_HEADER = re.compile(b'[\x65|\x45]')
+        else:
+            self.NALU_IDR_HEADER = re.compile(b'[\x65]') 
 
         #########################################################################################
         # Step 3 is finally to look for iframes on the drive, and attempt to decode them on the fly with any of the SPS/PPS headers found
@@ -432,17 +489,19 @@ class frameFinder:
 
                 # Transfer the frames which have 0 remaining length to be appended to the "complete_iframes" list
                 # Also remove them from the "potential_iframes" list
-                # If we find a single instance of 00 00 00 00/01/02/03, then it can't be a valid frame, as these should have had efmulation prevention bytes placed in them.
+                # If we find a single instance of 00 00 00 00/01/02/03, then it can't be a valid frame, as these should have had emulation prevention bytes placed in them.
                 
-                self.complete_iframes += [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] <= 0 and b"\x00\x00\x00\x00" not in partial_frame["data"]
-                and b"\x00\x00\x00\x01" not in partial_frame["data"]
-                and b"\x00\x00\x00\x02" not in partial_frame["data"]
-                and b"\x00\x00\x00\x03" not in partial_frame["data"]]
+                self.complete_iframes += [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] <= 0]
+
+                self.prev_cluster = cluster
 
 
                 self.potential_iframes =  [partial_frame for partial_frame in self.potential_iframes if partial_frame["remaining_length"] != 0 ]
-                
-                if (len(self.complete_iframes) > self.decoding_buffer) and (self.parse_exp_golomb(self.complete_iframes[-1]["data"][1:30],1) != 0 ):
+
+
+                if self.complete_iframes == []:
+                    None
+                elif (len(self.complete_iframes) > self.decoding_buffer) and (self.parse_exp_golomb(self.complete_iframes[-1]["data"][1:30],2)[0] != 0 ):
                     self.decode_iframes(self.NUM_PROCS)
                     self.complete_iframes = []
 
