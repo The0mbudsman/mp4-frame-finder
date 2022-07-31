@@ -44,17 +44,13 @@ class frameFinder:
         # However, Since the vast majority of IDR frames are 65, instead of 25 or 45 following convention, we only search for 25s/45s if we find
         # a header that has 27 28 / 47 48 , as they come in threes.
 
-        self.NALU_IDR_HEADER = re.compile(b'[\x65]')  # Coded slice of an IDR picture. 45 and or 25 are added to this iff needed as above.
+        self.NALU_IDR_HEADER = re.compile(b'[\x65|\x45|\x25]') # Coded slice of an IDR picture. 45 and or 25 are added to this iff needed as above.
         self.NALU_SPS_HEADER = re.compile(b'[\x67|\x47|\x27]') # Sequence Parameter Set options
         self.NALU_PPS_HEADER = re.compile(b'[\x68|\x48|\x28]') # Picture Parameter Set options
         self.AVCC_BOX_HEADER = b"\x61\x76\x63\x43"  # avcC atom header
         self.OUTPUT_DIR_NAME = output_dir_name
 
         self.emulation_bytes = re.compile(b"\x00\x00\x00[\x00-\x03]")
-
-        # As above, only search for these if we have to, as it has the potential to slow down operation.
-        self.twentyflag = False
-        self.fourtyflag = False
 
         #Operational params 
         self.clustersize = clustersize
@@ -184,10 +180,6 @@ class frameFinder:
                             else:
                                 PPS = bytes_after_SPS[match:match+size+1]
                                 complete_header = b"\x00\x00\x01" + SPS + b"\x00\x00\x01" + PPS
-                                if (SPS[0:1] == b"\x27" and PPS[0:1] == b"\x28"):
-                                    self.twentyflag = True
-                                if (SPS[0:1] == b"\x47" and PPS[0:1] == b"\x48"):
-                                    self.fourtyflag = True
                                 self.complete_h264_headers.append({"data": complete_header, "saved_count": 0})
 
     def register_partial_SPS_PPS_header(self, i:int, bytes:bytes):
@@ -256,7 +248,7 @@ class frameFinder:
     def get_iframes(self, i, cluster:bytes, match:int):
         """This parses the iframe start. It checks whether the I-frame size falls into limits defined below,
         similar to the SPS/PPS header size """
-        MIN_IFRAME_SIZE = 10
+        MIN_IFRAME_SIZE = 100
         MAX_IFRAME_SIZE = 1510000
         if (match < 4):
             from_prev_cluster = 4-match
@@ -266,10 +258,14 @@ class frameFinder:
             potential_byte_size = cluster[match-4:match]
 
         iframe_size = int.from_bytes(potential_byte_size, "big")
+
         if (iframe_size > MIN_IFRAME_SIZE and iframe_size < MAX_IFRAME_SIZE):  # limits determined from tests
             length_of_data_to_append = min(iframe_size, (len(cluster)-match))
             mb_in_slice, slice_type = self.parse_exp_golomb(cluster[match+1:match+11],2)
-            if slice_type != 2 and slice_type != 7:
+            if ( cluster[match+1:match+11].hex() == ""):
+                #Slice type cannot be determined so we have to assume yes
+                None
+            elif slice_type != 2 and slice_type != 7:
                 return
             # Here we define our frame object
             # total length = as determined above
@@ -307,12 +303,11 @@ class frameFinder:
                 blob += header["data"] + b"\x00\x00\x01" + frame["data"]
             else:
                 blob += b"\x00\x00\x01" + frame["data"]
-        # with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
-        #     f.write(blob)
+        with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
+            f.write(blob)
         process = (ffmpeg
-                .input("pipe:", f="h264", r="3")
-                .filter("setpts", "N")
-                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="0", vcodec="mjpeg", loglevel="quiet")
+                .input("pipe:", f="h264", r="3", skip_frame="nokey")
+                .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="0", use_wallclock_as_timestamps="1", vcodec="mjpeg", loglevel="quiet")
                 .run_async(pipe_stdin=True)
                 )
         process.communicate(input=blob)
@@ -455,15 +450,7 @@ class frameFinder:
                 print(f"Made Directory ./{self.OUTPUT_DIR_NAME}/header_{i}")
 
         # Assemble IDR regex and pre-compile
-        # This could probably be nicer.
-        if (self.twentyflag and self.fourtyflag):
-            self.NALU_IDR_HEADER = re.compile(b'[\x65|\x45|\x25]')
-        elif (self.twentyflag):
-            self.NALU_IDR_HEADER = re.compile(b'[\x65|\x25]')
-        elif (self.fourtyflag):
-            self.NALU_IDR_HEADER = re.compile(b'[\x65|\x45]')
-        else:
-            self.NALU_IDR_HEADER = re.compile(b'[\x65]') 
+
 
         #########################################################################################
         # Step 3 is finally to look for iframes on the drive, and attempt to decode them on the fly with any of the SPS/PPS headers found
