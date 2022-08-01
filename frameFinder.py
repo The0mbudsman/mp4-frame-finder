@@ -303,8 +303,8 @@ class frameFinder:
                 blob += header["data"] + b"\x00\x00\x01" + frame["data"]
             else:
                 blob += b"\x00\x00\x01" + frame["data"]
-        with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
-            f.write(blob)
+        # with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
+        #     f.write(blob)
         process = (ffmpeg
                 .input("pipe:", f="h264", r="3", skip_frame="nokey")
                 .output(f"./{self.OUTPUT_DIR_NAME}/header_{i}/frame%5d.jpg", start_number=(header["saved_count"]+1), vsync="0", use_wallclock_as_timestamps="1", vcodec="mjpeg", loglevel="quiet")
@@ -449,7 +449,6 @@ class frameFinder:
                 os.makedirs(f"./{self.OUTPUT_DIR_NAME}/header_{i}", exist_ok=True)
                 print(f"Made Directory ./{self.OUTPUT_DIR_NAME}/header_{i}")
 
-        # Assemble IDR regex and pre-compile
 
 
         #########################################################################################
