@@ -168,7 +168,7 @@ class frameFinder:
                 if not found:
                     continue
                 else:
-                    SPS = bytes[match:match+size+1]
+                    SPS = bytes[match:match+size]
                     bytes_after_SPS = bytes[match+size:]
                     potential_PPS_indices = [_.start() for _ in re.finditer(self.NALU_PPS_HEADER, bytes_after_SPS)]
                     if potential_PPS_indices == []:
@@ -179,8 +179,8 @@ class frameFinder:
                             if not found:
                                 continue
                             else:
-                                PPS = bytes_after_SPS[match:match+size+1]
-                                complete_header = b"\x00\x00\x01" + SPS + b"\x00\x00\x01" + PPS
+                                PPS = bytes_after_SPS[match:match+size]
+                                complete_header = b"\x00\x00\x00\x01" + SPS + b"\x00\x00\x00\x01" + PPS
                                 self.complete_h264_headers.append({"data": complete_header, "saved_count": 0})
 
     def register_partial_SPS_PPS_header(self, i:int, bytes:bytes):
@@ -268,6 +268,7 @@ class frameFinder:
                 None
             elif slice_type != 2 and slice_type != 7:
                 return
+            print(f"Size {iframe_size} based on {potential_byte_size.hex()} bytes, slicetype = {slice_type}, bytes are {cluster[match-4:match+4].hex()}")
             # Here we define our frame object
             # total length = as determined above
             # remaining_length = The remaining number of bytes to append to it (this gets decremented)
@@ -296,8 +297,8 @@ class frameFinder:
         '''This helps with multipool'''
         headers_tup, complete_iframes = data_zip
         i, header = headers_tup
-        fancyblob = b"\x00"
-        blob = b"\x00" # starting delimiter has an additional 0 byte.
+        fancyblob = b""
+        blob = b"" # starting delimiter has an additional 0 byte.
         ## assemble an annex B compliant blob of SPS, PPS, IDR FRAME, SPS, PPS, IDR FRAME, ETC....
         # The header["data"] variable already has 0000001 in it.
         for frame in complete_iframes:
@@ -529,7 +530,7 @@ class frameFinder:
                     if not cleaned:
                         color_thief = ColorThief(file)
                         try:
-                            palette = color_thief.get_palette(color_count=10)[1:]
+                            palette = color_thief.get_palette(color_count=10, quality=100)[1:]
                             delete = all(colour == palette[0] for colour in palette)
                             if delete:
                                 os.remove(file)
