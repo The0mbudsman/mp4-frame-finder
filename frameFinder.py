@@ -268,7 +268,6 @@ class frameFinder:
                 None
             elif slice_type != 2 and slice_type != 7:
                 return
-            print(f"Size {iframe_size} based on {potential_byte_size.hex()} bytes, slicetype = {slice_type}, bytes are {cluster[match-4:match+4].hex()}")
             # Here we define our frame object
             # total length = as determined above
             # remaining_length = The remaining number of bytes to append to it (this gets decremented)
@@ -308,8 +307,8 @@ class frameFinder:
             else:
                 fancyblob += b"\x00\x00\x01" + frame["data"]
             blob += header["data"] + b"\x00\x00\x01" + frame["data"]
-        with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
-            f.write(blob)
+        # with open(f"./{self.OUTPUT_DIR_NAME}/header_{i}/blob.h264", "wb") as f:
+        #     f.write(blob)
         process = (ffmpeg
                 .input("pipe:", f="h264", skip_frame="nokey")
                 .filter("setpts", "N/SR/TB")
