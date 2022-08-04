@@ -13,7 +13,7 @@ For a quick proof of concept you can pass it a complete video file in MP4/AVCC f
 The motivation behind this tool is that extraction and reassembly of many fragments from a large video file is a computationally costly process, but a single i-frame may hold the information you need from the video
 
 <h3>Requirements</h3>
-Currently only tested on python 3.9 and Linux
+Use Python 3.9 or above. Python 3.8 was found to be about half the performance of Python 9+
 
 Requires FFmpeg to be installed, only tested with version 4.4.2-1+b1
 
